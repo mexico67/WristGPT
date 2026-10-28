@@ -7,7 +7,7 @@
 - Подготовлены исходники iPhone + watchOS и GitHub Actions для сборки без собственного Mac.
 - На Windows подготовлена локальная программа Bridge с официальным Sign in with ChatGPT.
 - Проверены DPAPI, TLS-сертификат, PKCE/state, защита локальных HTTP-эндпоинтов и обработка успешных/прерванных потоков.
-- Сборка iPhone + Watch успешно выполнена в GitHub Actions: https://github.com/mexico67/WristGPT/actions/runs/40742774763. Проверены два исполняемых файла в IPA и связь Bundle ID. Вход в настоящий аккаунт, получение ответа от GPT и установка на физические часы ещё требуют проверки.
+- Сборка iPhone + Watch успешно выполнена в GitHub Actions: https://github.com/mexico67/WristGPT/actions/runs/40744716962. Проверены два исполняемых файла в IPA и связь Bundle ID. Вход в настоящий аккаунт, получение ответа от GPT и установка на физические часы ещё требуют проверки.
 
 ## Что нужно
 
@@ -41,8 +41,9 @@
 
 - iLoader `70f37e9b4afc659ab44ec1944c034093f4cda416`.
 - isideload `f7b9f3da570edd6824c29680545e710846d07df5`.
-- Сборка Windows: <https://github.com/Rzbck/iloader/actions/runs/34436587217>.
-- SHA-256 установщика: `34BB3422BA7983490C501E65D388BD60140F341A708AA75E00FA64D8A9F92B9A`.
+- Сборка Windows с исправленным входом: <https://github.com/Rzbck/iloader/actions/runs/34568140488>.
+- Обновление добавляет два исправления авторизации поверх той же поддержки Watch: iLoader f2efcc3c9784e7446abf8573ee3514e779ea083c, isideload 13db9b28ff72f42fc6432fbeac592004bede57c7.
+- SHA-256 установщика: `7164ECB45FDD406F37D061EC8D5C0D4D97CAD2F9D2FEF321BCFFBE86AB72F467`.
 
 Эта ветка не является официальным релизом iLoader. Автор сообщает об успешной физической проверке; совместимость со всеми версиями iOS/watchOS не установлена.
 
