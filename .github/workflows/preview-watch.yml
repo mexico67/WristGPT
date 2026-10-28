@@ -1,0 +1,53 @@
+name: Verify native Watch interface
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  watch-preview:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen
+      - run: cd Apple && xcodegen generate
+      - name: Build Watch simulator app
+        run: |
+          set -o pipefail
+          xcodebuild -project Apple/WristGPT.xcodeproj -scheme WristGPTWatch \
+            -configuration Debug -sdk watchsimulator \
+            -destination 'generic/platform=watchOS Simulator' \
+            -derivedDataPath build-sim CODE_SIGNING_ALLOWED=NO build > simulator-build.log 2>&1
+      - name: Boot Series 9 simulator
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          def read(*args):
+              return json.loads(subprocess.check_output(['xcrun','simctl',*args,'--json']))
+          types = read('list','devicetypes')['devicetypes']
+          runtimes = read('list','runtimes')['runtimes']
+          device = next(d['identifier'] for d in types if 'Apple Watch Series 9' in d['name'] and '45mm' in d['name'])
+          runtime = next(r['identifier'] for r in runtimes if r.get('isAvailable') and 'watchOS' in r['identifier'] and int(r['version'].split('.')[0]) >= 10)
+          udid = subprocess.check_output(['xcrun','simctl','create','WristGPT Series 9',device,runtime],text=True).strip()
+          with open(os.environ['GITHUB_ENV'],'a') as f: f.write('WATCH_UDID='+udid+'\n')
+          PY
+          xcrun simctl boot "$WATCH_UDID"
+          xcrun simctl bootstatus "$WATCH_UDID" -b
+      - name: Capture actual native interface
+        run: |
+          xcrun simctl install "$WATCH_UDID" build-sim/Build/Products/Debug-watchsimulator/WristGPTWatch.app
+          xcrun simctl launch "$WATCH_UDID" personal.wristgpt.phone.watchkitapp
+          sleep 4
+          xcrun simctl io "$WATCH_UDID" screenshot Watch-home.png
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: WristGPT-native-preview
+          path: Watch-home.png
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: simulator-diagnostics
+          path: simulator-build.log
+          retention-days: 3
