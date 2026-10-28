@@ -1,0 +1,14 @@
+.private/
+.venv/
+__pycache__/
+*.pyc
+*.enc
+*.pem
+*.p12
+*.mobileprovision
+*.ipa
+build/
+package/
+*.log
+*.xcodeproj/
+.DS_Store

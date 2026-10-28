@@ -1,0 +1,41 @@
+name: Build WristGPT for iPhone and Watch
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install project generator
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: cd Apple && xcodegen generate
+      - name: Build iPhone app with embedded Watch app
+        run: |
+          set -o pipefail
+          xcodebuild -project Apple/WristGPT.xcodeproj -scheme WristGPT \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build | tee build.log
+      - name: Package unsigned IPA
+        run: |
+          test -d build/Build/Products/Release-iphoneos/WristGPT.app/Watch/WristGPTWatch.app
+          mkdir -p package/Payload
+          cp -R build/Build/Products/Release-iphoneos/WristGPT.app package/Payload/
+          cd package && zip -qry ../WristGPT-unsigned.ipa Payload
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: WristGPT-unsigned-IPA
+          path: WristGPT-unsigned.ipa
+          retention-days: 7
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: build.log
+          retention-days: 3
