@@ -97,3 +97,9 @@
 - Apple, бесплатный Personal Team: <https://developer.apple.com/help/account/basics/about-your-developer-account>
 - Apple, установка из App Store: <https://support.apple.com/en-ie/109023>
 - GitHub runners: <https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job>
+
+## Проверенная авторизация установщика
+
+28 октября 2026 вход в официальный iLoader 2.4.1 прошёл успешно. Авторизация из isideload 0.5.2 перенесена в community-ветку Watch; исходники авторизации сверены с опубликованным crate. Сборка: https://github.com/mexico67/WristGPT/actions/runs/40752122955 (успешно). Пользователь подтвердил вход и в объединённой версии; интерфейс показывает активный аккаунт и iPhone по USB. Установка пакета WristGPT ещё не подтверждена.
+
+Ярлык: `iLoader Watch обновлённый.lnk`. SHA-256 установщика: `696A42DB7245ECB0308AC583A9CD1C9862EA68B53E26DFF6A920ECF541EC7859`. SHA-256 исполняемого файла: `9E328972174393BA4978CE9900D4D1FE46F2B4978936F4FD11F060B8BA05B8A8`.
