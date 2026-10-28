@@ -1,3 +1,4 @@
+param([switch]$NoBrowser)
 $ErrorActionPreference = 'Stop'
 $bridgeRoot = Join-Path $PSScriptRoot 'Bridge'
 $runtimeDirectory = Join-Path $PSScriptRoot '.venv'
@@ -14,4 +15,5 @@ $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Nam
 & icacls.exe $privateDirectory /inheritance:r /grant:r ($currentIdentity + ':(OI)(CI)F') '*S-1-5-18:(OI)(CI)F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot restrict credential directory permissions.' }
 $env:WRISTGPT_STATE = $privateDirectory
-& $pythonExecutable (Join-Path $bridgeRoot 'bridge.py')
+if ($NoBrowser) { & $pythonExecutable (Join-Path $bridgeRoot 'bridge.py') --no-browser }
+else { & $pythonExecutable (Join-Path $bridgeRoot 'bridge.py') }
