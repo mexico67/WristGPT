@@ -18,7 +18,7 @@ jobs:
             -configuration Debug -sdk watchsimulator \
             -destination 'generic/platform=watchOS Simulator' \
             -derivedDataPath build-sim CODE_SIGNING_ALLOWED=NO build > simulator-build.log 2>&1
-      - name: Boot Series 9 simulator
+      - name: Create Series 9 simulator
         run: |
           python3 - <<'PY'
           import json, os, subprocess
@@ -31,6 +31,8 @@ jobs:
           udid = subprocess.check_output(['xcrun','simctl','create','WristGPT Series 9',device,runtime],text=True).strip()
           with open(os.environ['GITHUB_ENV'],'a') as f: f.write('WATCH_UDID='+udid+'\n')
           PY
+      - name: Boot Series 9 simulator
+        run: |
           xcrun simctl boot "$WATCH_UDID"
           xcrun simctl bootstatus "$WATCH_UDID" -b
       - name: Capture actual native interface
