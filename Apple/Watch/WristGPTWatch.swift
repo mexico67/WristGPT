@@ -65,12 +65,17 @@ struct WatchHome: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if chat.messages.isEmpty {
-                        HStack(spacing: 5) {
+                    HStack(spacing: 5) {
                             Circle().fill(connection.pairing == nil ? .orange : mint).frame(width: 5, height: 5)
                             Text(connection.pairing == nil ? "НУЖЕН IPHONE" : "ВАША ПОДПИСКА")
                                 .font(.system(size: 9, weight: .semibold)).tracking(1.2).foregroundStyle(.secondary)
-                        }.padding(.top, 4)
+                            Spacer(minLength: 0)
+                            NavigationLink { settings } label: {
+                                Text("•••").font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(mint).frame(width: 30, height: 24)
+                            }.buttonStyle(.plain).accessibilityLabel("Настройки")
+                    }.padding(.top, 4)
+                    if chat.messages.isEmpty {
                         Text("Что хотите\nузнать?").font(.system(size: 27, weight: .semibold, design: .rounded)).lineSpacing(-2)
                             .accessibilityAddTraits(.isHeader)
                         Button { draft = ""; composing = true } label: {
@@ -108,11 +113,6 @@ struct WatchHome: View {
                 }.padding(.horizontal, 2).padding(.bottom, 12)
             }
             .navigationTitle("WristGPT").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink { settings } label: { Image(systemName: "ellipsis").foregroundStyle(.secondary) }.accessibilityLabel("Настройки")
-                }
-            }
             .sheet(isPresented: $composing) {
                 VStack(spacing: 12) {
                     Text("Ваш вопрос").font(.headline)
