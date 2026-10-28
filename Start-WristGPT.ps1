@@ -1,5 +1,12 @@
 param([switch]$NoBrowser)
 $ErrorActionPreference = 'Stop'
+try {
+    $existingBridge = Invoke-WebRequest -Uri 'http://127.0.0.1:8765/' -TimeoutSec 2 -UseBasicParsing
+    if ($existingBridge.StatusCode -eq 200 -and $existingBridge.Content -match '<title>WristGPT') {
+        if (-not $NoBrowser) { Start-Process 'http://127.0.0.1:8765/' }
+        return
+    }
+} catch { }
 $bridgeRoot = Join-Path $PSScriptRoot 'Bridge'
 $runtimeDirectory = Join-Path $PSScriptRoot '.venv'
 $pythonExecutable = Join-Path $runtimeDirectory 'Scripts/python.exe'

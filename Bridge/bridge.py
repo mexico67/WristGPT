@@ -169,8 +169,8 @@ def access_token():
             save_auth(auth)
         return p['access_token']
 
-def models():
-    result = request_json(API + '/models', bearer=access_token())
+def models(bearer=None):
+    result = request_json(API + '/models', bearer=bearer or access_token())
     return [{'id':m['slug'], 'name':m.get('display_name',m['slug'])}
             for m in result.get('models', []) if m.get('visibility') == 'list' and m.get('slug')]
 
@@ -215,13 +215,14 @@ def ask(data):
             if not isinstance(message,dict) or message.get('role') not in ('user','assistant') or not isinstance(message.get('content'),str):
                 raise RuntimeError('Некорректное сообщение.')
             if len(message['content'])>12000: raise RuntimeError('Слишком длинное сообщение.')
-        available = models()
+        bearer = access_token()
+        available = models(bearer)
         selected = data.get('model') or (available[0]['id'] if available else None)
         if selected not in [m['id'] for m in available]: raise RuntimeError('Выберите доступную модель в настройках.')
         payload = {'model':selected,'input':history,'store':False,'stream':True,
                    'instructions':'Отвечай на языке пользователя. Ответ читают на Apple Watch: будь краток, обычно до 100 слов. Если просят подробно, ответь подробно. Не выдумывай факты.'}
         req = urllib.request.Request(API+'/responses', data=pack(payload), headers={
-            'Authorization':'Bearer '+access_token(),'Content-Type':'application/json','Accept':'text/event-stream'})
+            'Authorization':'Bearer '+bearer,'Content-Type':'application/json','Accept':'text/event-stream'})
         try:
             with urllib.request.urlopen(req,timeout=150) as response: text = parse_stream(response)
         except urllib.error.HTTPError as e:
