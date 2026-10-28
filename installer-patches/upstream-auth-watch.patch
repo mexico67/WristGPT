@@ -1,0 +1,1109 @@
+diff --git a/isideload/src/anisette/mod.rs b/isideload/src/anisette/mod.rs
+index ec43baf..fa12a32 100644
+--- a/isideload/src/anisette/mod.rs
++++ b/isideload/src/anisette/mod.rs
+@@ -101,16 +101,25 @@ impl AnisetteData {
+     }
+ }
+ 
++#[derive(Debug, Clone)]
++pub enum AnisetteDataResponse {
++    Data(AnisetteData),
++    NeedsProvisioning,
++    IncorrectlyProvisioned,
++}
++
+ #[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+ #[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
+ pub trait AnisetteProvider {
+-    async fn get_anisette_data(&self) -> Result<AnisetteData, Report>;
++    async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report>;
+ 
+-    async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report>;
++    async fn resync(&self, _sim: &str) -> Result<AnisetteDataResponse, Report> {
++        Err(report!("anisette resync not supported by this provider"))
++    }
+ 
+-    async fn provision(&mut self, gs: Arc<GrandSlam>) -> Result<(), Report>;
++    async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report>;
+ 
+-    fn needs_provisioning(&self) -> Result<bool, Report>;
++    async fn provision(&mut self, gs: &Arc<GrandSlam>, force_recheck: bool) -> Result<(), Report>;
+ }
+ 
+ #[derive(Clone)]
+@@ -137,25 +146,38 @@ impl AnisetteDataGenerator {
+             return Ok(data.clone());
+         }
+ 
+-        // trying to avoid locking as write unless necessary to promote concurrency
+-        let provider = self.provider.read().await;
++        // 3 attempts for the worst case: load anisette from storage, server says -45061 -> reprovision anisette -> get data
++        let data = self.get_data_or_provision(&gs, 3).await?;
++        let arc_data = Arc::new(data);
++        self.data = Some(arc_data.clone());
++        Ok(arc_data)
++    }
+ 
+-        if provider.needs_provisioning()? {
+-            drop(provider);
+-            let mut provider_write = self.provider.write().await;
+-            provider_write.provision(gs).await?;
+-            drop(provider_write);
+-
+-            let provider = self.provider.read().await;
+-            let data = provider.get_anisette_data().await?;
+-            let arc_data = Arc::new(data);
+-            self.data = Some(arc_data.clone());
+-            Ok(arc_data)
+-        } else {
+-            let data = provider.get_anisette_data().await?;
+-            let arc_data = Arc::new(data);
+-            self.data = Some(arc_data.clone());
+-            Ok(arc_data)
++    async fn get_data_or_provision(
++        &mut self,
++        gs: &Arc<GrandSlam>,
++        max_iters: usize,
++    ) -> Result<AnisetteData, Report> {
++        if max_iters == 0 {
++            bail!("Max anisette provisioning attempts reached");
++        }
++        // trying to avoid locking as write unless necessary for concurrency later on
++        let provider = self.provider.read().await;
++        match provider.get_anisette_data().await? {
++            AnisetteDataResponse::Data(data) => Ok(data),
++            status @ (AnisetteDataResponse::NeedsProvisioning
++            | AnisetteDataResponse::IncorrectlyProvisioned) => {
++                drop(provider);
++                let mut provider_write = self.provider.write().await;
++                provider_write
++                    .provision(
++                        gs,
++                        matches!(status, AnisetteDataResponse::IncorrectlyProvisioned),
++                    )
++                    .await?;
++                drop(provider_write);
++                Box::pin(self.get_data_or_provision(gs, max_iters - 1)).await
++            }
+         }
+     }
+ 
+@@ -163,4 +185,18 @@ impl AnisetteDataGenerator {
+         let provider = self.provider.read().await;
+         provider.get_client_info().await
+     }
++
++    /// Perform a login anisette resync with the server, returning corrected data.
++    pub async fn resync(&mut self, sim: &str) -> Result<Arc<AnisetteData>, Report> {
++        let provider = self.provider.read().await;
++        let data = match provider.resync(sim).await? {
++            AnisetteDataResponse::Data(data) => data,
++            _ => {
++                bail!("Anisette provider failed to provide data for resync, needs provisioning");
++            }
++        };
++        let arc_data = Arc::new(data);
++        self.data = Some(arc_data.clone());
++        Ok(arc_data)
++    }
+ }
+diff --git a/isideload/src/anisette/remote_v3/mod.rs b/isideload/src/anisette/remote_v3/mod.rs
+index 579bb59..65f05a4 100644
+--- a/isideload/src/anisette/remote_v3/mod.rs
++++ b/isideload/src/anisette/remote_v3/mod.rs
+@@ -16,14 +16,18 @@ use rootcause::prelude::*;
+ use serde::Deserialize;
+ use tracing::{debug, info, warn};
+ 
+-use crate::anisette::remote_v3::{state::AnisetteState, websocket::WsMessage};
++use crate::anisette::remote_v3::websocket::AppWebSocket;
+ use crate::anisette::{AnisetteClientInfo, AnisetteData, AnisetteProvider};
++use crate::anisette::{
++    AnisetteDataResponse,
++    remote_v3::{state::AnisetteState, websocket::WsMessage},
++};
+ use crate::auth::grandslam::GrandSlam;
+ use crate::util::plist::PlistDataExtract;
+ use crate::util::storage::{SideloadingStorage, new_storage};
+-use crate::{SideloadError, anisette::remote_v3::websocket::AppWebSocket};
+ 
+-pub const DEFAULT_ANISETTE_V3_URL: &str = "https://ani.stikstore.app";
++pub const DEFAULT_ANISETTE_V3_URL: &str = "https://ani.iloader.app";
++pub const ANISETTE_STATE_KEY: &str = "anisette_state";
+ 
+ pub struct RemoteV3AnisetteProvider {
+     pub state: Option<AnisetteState>,
+@@ -32,6 +36,7 @@ pub struct RemoteV3AnisetteProvider {
+     serial_number: String,
+     client: reqwest_middleware::ClientWithMiddleware,
+     websocket_proxy: Option<String>,
++    client_info_override: Option<AnisetteClientInfo>,
+ }
+ 
+ impl RemoteV3AnisetteProvider {
+@@ -53,6 +58,7 @@ impl RemoteV3AnisetteProvider {
+             serial_number,
+             client: Self::build_reqwest_client(None)?,
+             websocket_proxy: None,
++            client_info_override: None,
+         })
+     }
+ 
+@@ -102,33 +108,79 @@ impl RemoteV3AnisetteProvider {
+         self.serial_number = serial_number;
+         self
+     }
++
++    pub fn set_client_info_override(
++        mut self,
++        client_info_override: Option<AnisetteClientInfo>,
++    ) -> RemoteV3AnisetteProvider {
++        self.client_info_override = client_info_override;
++        self
++    }
+ }
+ 
+ #[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+ #[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
+ impl AnisetteProvider for RemoteV3AnisetteProvider {
+-    async fn get_anisette_data(&self) -> Result<AnisetteData, Report> {
+-        let state = self
+-            .state
+-            .as_ref()
+-            .ok_or(SideloadError::AnisetteNotProvisioned)?;
+-        let adi_pb = state
+-            .adi_pb
+-            .as_ref()
+-            .ok_or(SideloadError::AnisetteNotProvisioned)?;
++    async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report> {
++        self.fetch_headers(None).await
++    }
++
++    async fn resync(&self, sim: &str) -> Result<AnisetteDataResponse, Report> {
++        self.fetch_headers(Some(sim)).await
++    }
++
++    async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
++        if let Some(client_info_override) = self.client_info_override.as_ref() {
++            return Ok(client_info_override.clone());
++        }
++        let info = self
++            .client
++            .get(format!("{}/v3/client_info", self.url))
++            .send()
++            .await
++            .context("Failed to request /v3/client_info from anisette server")?
++            .error_for_status()
++            .context("anisette server returned an error for /v3/client_info")?
++            .json::<AnisetteClientInfo>()
++            .await
++            .context("Failed to parse /v3/client_info response")?;
++        Ok(info)
++    }
++
++    async fn provision(&mut self, gs: &Arc<GrandSlam>, force_reset: bool) -> Result<(), Report> {
++        self.get_client_info().await?;
++        self.get_state(gs, force_reset).await?;
++        Ok(())
++    }
++}
++
++impl RemoteV3AnisetteProvider {
++    async fn fetch_headers(&self, sim: Option<&str>) -> Result<AnisetteDataResponse, Report> {
++        let Some(state) = self.state.as_ref() else {
++            return Ok(AnisetteDataResponse::NeedsProvisioning);
++        };
++
++        let Some(adi_pb) = state.adi_pb.as_ref() else {
++            return Ok(AnisetteDataResponse::NeedsProvisioning);
++        };
++
+         let client_info = self.get_client_info().await?;
+ 
++        let mut body = serde_json::json!({
++            "identifier": BASE64_STANDARD.encode(state.keychain_identifier),
++            "adi_pb": BASE64_STANDARD.encode(adi_pb),
++        });
++        if let Some(sim) = sim {
++            body["sim"] = serde_json::Value::String(sim.to_string());
++            body["device_id"] = serde_json::Value::String(state.get_device_id());
++            body["md_lu"] = serde_json::Value::String(hex::encode(state.get_md_lu()));
++        }
++
+         let headers = self
+             .client
+             .post(format!("{}/v3/get_headers", self.url))
+             .header(CONTENT_TYPE, "application/json")
+-            .body(
+-                serde_json::json!({
+-                "identifier": BASE64_STANDARD.encode(state.keychain_identifier),
+-                "adi_pb": BASE64_STANDARD.encode(adi_pb)
+-                })
+-                .to_string(),
+-            )
++            .body(body.to_string())
+             .send()
+             .await?
+             .error_for_status()?
+@@ -140,51 +192,35 @@ impl AnisetteProvider for RemoteV3AnisetteProvider {
+                 machine_id,
+                 one_time_password,
+                 routing_info,
+-            } => {
+-                let data = AnisetteData {
+-                    machine_id,
+-                    one_time_password,
+-                    routing_info,
+-                    _device_description: client_info.client_info.clone(),
+-                    device_unique_identifier: state.get_device_id(),
+-                    _local_user_id: hex::encode(state.get_md_lu()),
+-                    generated_at: SystemTime::now(),
+-                };
+-
+-                Ok(data)
+-            }
++            } => Ok(AnisetteDataResponse::Data(AnisetteData {
++                machine_id,
++                one_time_password,
++                routing_info,
++                _device_description: client_info.client_info.clone(),
++                device_unique_identifier: state.get_device_id(),
++                _local_user_id: hex::encode(state.get_md_lu()),
++                generated_at: SystemTime::now(),
++            })),
+             AnisetteHeaders::GetHeadersError { message } => {
++                if message.contains("-45061") {
++                    warn!("Server says anisette not provisioned");
++                    return Ok(AnisetteDataResponse::IncorrectlyProvisioned);
++                }
+                 Err(report!("Failed to get anisette headers").attach(message))
+             }
+         }
+     }
+ 
+-    async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
+-        Ok(AnisetteClientInfo {
+-            client_info: "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>".to_string(),
+-            user_agent: "akd/1.0 CFNetwork/808.1.4".to_string(),
+-        })
+-    }
+-
+-    fn needs_provisioning(&self) -> Result<bool, Report> {
+-        if let Some(state) = &self.state {
+-            Ok(!state.is_provisioned())
+-        } else {
+-            Ok(true)
+-        }
+-    }
+-
+-    async fn provision(&mut self, gs: Arc<GrandSlam>) -> Result<(), Report> {
+-        self.get_client_info().await?;
+-        self.get_state(gs).await?;
+-        Ok(())
+-    }
+-}
+-
+-impl RemoteV3AnisetteProvider {
+-    async fn get_state(&mut self, gs: Arc<GrandSlam>) -> Result<&mut AnisetteState, Report> {
+-        if self.state.is_none() {
+-            if let Ok(Some(state)) = &self.storage.retrieve_data("anisette_state") {
++    async fn get_state(
++        &mut self,
++        gs: &Arc<GrandSlam>,
++        force_reset: bool,
++    ) -> Result<&mut AnisetteState, Report> {
++        if force_reset {
++            warn!("Resetting anisette state");
++            self.state = Some(AnisetteState::new());
++        } else if self.state.is_none() {
++            if let Ok(Some(state)) = &self.storage.retrieve_data(ANISETTE_STATE_KEY) {
+                 if let Ok(state) = plist::from_bytes(state) {
+                     info!("Loaded existing anisette state");
+                     self.state = Some(state);
+@@ -209,7 +245,7 @@ impl RemoteV3AnisetteProvider {
+         let mut writer = std::io::BufWriter::new(buf);
+         plist::to_writer_xml(&mut writer, &state)?;
+         self.storage
+-            .store_data("anisette_state", &writer.into_inner()?)?;
++            .store_data(ANISETTE_STATE_KEY, &writer.into_inner()?)?;
+ 
+         Ok(state)
+     }
+@@ -241,7 +277,7 @@ impl RemoteV3AnisetteProvider {
+     }
+     async fn provision(
+         state: &mut AnisetteState,
+-        gs: Arc<GrandSlam>,
++        gs: &Arc<GrandSlam>,
+         url: &str,
+         proxy_url: Option<&str>,
+     ) -> Result<(), Report> {
+@@ -305,6 +341,7 @@ impl RemoteV3AnisetteProvider {
+                             &start_provisioning,
+                             &body,
+                             Some(Self::provisioning_headers(state).await?),
++                            None,
+                         )
+                         .await
+                         .context("Failed to send start provisioning request")?;
+@@ -336,6 +373,7 @@ impl RemoteV3AnisetteProvider {
+                             &end_provisioning,
+                             &body,
+                             Some(Self::provisioning_headers(state).await?),
++                            None,
+                         )
+                         .await
+                         .context("Failed to send end provisioning request")?;
+diff --git a/isideload/src/auth/apple_account.rs b/isideload/src/auth/apple_account.rs
+index 9d2cc41..083b673 100644
+--- a/isideload/src/auth/apple_account.rs
++++ b/isideload/src/auth/apple_account.rs
+@@ -1,5 +1,6 @@
+-use std::{future::Future, sync::Arc};
++use std::sync::Arc;
+ 
++use crate::util::callbacks::TwoFactorCallback;
+ use crate::{
+     SideloadError,
+     anisette::{AnisetteData, AnisetteDataGenerator},
+@@ -24,7 +25,7 @@ use rootcause::prelude::*;
+ use serde::{Deserialize, Serialize};
+ use sha2::{Digest, Sha256};
+ use srp::{ClientVerifier, groups::G2048};
+-use tracing::{debug, info, warn};
++use tracing::{debug, error, info, warn};
+ 
+ pub struct AppleAccount {
+     pub email: String,
+@@ -35,6 +36,7 @@ pub struct AppleAccount {
+     login_state: LoginState,
+     debug: bool,
+     last_error: Option<String>,
++    err_429_retries: Option<u32>,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -85,6 +87,50 @@ pub struct SMSTwoFactorError {
+     pub message: String,
+ }
+ 
++#[derive(Debug)]
++enum SmsSendOutcome {
++    Sent,
++    ActiveChallenge,
++    ServiceError(SMSTwoFactorError),
++}
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct SmsChallengeResponse {
++    mode: String,
++    #[serde(rename = "type")]
++    challenge_type: String,
++    authentication_type: String,
++    trusted_phone_numbers: Vec<TrustedNumber>,
++    trusted_phone_number: TrustedNumber,
++    security_code: SmsSecurityCode,
++}
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct SmsSecurityCode {
++    length: u8,
++    too_many_codes_sent: bool,
++    too_many_codes_validated: bool,
++    security_code_locked: bool,
++    security_code_cooldown: bool,
++}
++
++/// Extracts the resync SIM (base64 `X-Apple-I-MD-DATA`) from a GSA response that
++/// demands an anisette resync (`Status.hsc == 434`); `None` otherwise.
++fn resync_sim(resp: &plist::Dictionary) -> Option<String> {
++    use base64::prelude::*;
++    let status = resp.get("Status")?.as_dictionary()?;
++    if status.get("hsc").and_then(plist::Value::as_signed_integer) != Some(434) {
++        return None;
++    }
++    match status.get("X-Apple-I-MD-DATA")? {
++        plist::Value::Data(d) => Some(BASE64_STANDARD.encode(d)),
++        plist::Value::String(s) => Some(s.clone()),
++        _ => None,
++    }
++}
++
+ impl AppleAccount {
+     /// Create a new AppleAccountBuilder with the given email
+     ///
+@@ -106,6 +152,7 @@ impl AppleAccount {
+         anisette_generator: AnisetteDataGenerator,
+         debug: bool,
+         proxy_url: Option<String>,
++        err_429_retries: Option<u32>,
+     ) -> Result<Self, Report> {
+         if debug {
+             warn!("Debug mode enabled: this is a security risk!");
+@@ -127,6 +174,7 @@ impl AppleAccount {
+             login_state: LoginState::NeedsLogin,
+             trusted_phone_numbers: None,
+             last_error: None,
++            err_429_retries,
+         })
+     }
+ 
+@@ -136,40 +184,16 @@ impl AppleAccount {
+     /// - `two_factor_callback`: A callback function that returns the two-factor authentication code
+     /// # Errors
+     /// Returns an error if the login fails
+-    #[cfg(target_arch = "wasm32")]
+-    pub async fn login<C, Fut>(
+-        &mut self,
+-        password: &str,
+-        two_factor_callback: C,
+-    ) -> Result<(), Report>
+-    where
+-        C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
+-        Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>>,
+-    {
+-        self.login_impl(password, two_factor_callback).await
+-    }
+-
+-    #[cfg(not(target_arch = "wasm32"))]
+-    pub async fn login<C, Fut>(
+-        &mut self,
+-        password: &str,
+-        two_factor_callback: C,
+-    ) -> Result<(), Report>
++    pub async fn login<C>(&mut self, password: &str, two_factor_callback: C) -> Result<(), Report>
+     where
+-        C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
+-        Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>> + Send,
++        C: TwoFactorCallback,
+     {
+         self.login_impl(password, two_factor_callback).await
+     }
+ 
+-    async fn login_impl<C, Fut>(
+-        &mut self,
+-        password: &str,
+-        two_factor_callback: C,
+-    ) -> Result<(), Report>
++    async fn login_impl<C>(&mut self, password: &str, two_factor_callback: C) -> Result<(), Report>
+     where
+-        C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
+-        Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>>,
++        C: TwoFactorCallback,
+     {
+         info!("Logging in to Apple ID: {}", censor_email(&self.email));
+         if self.debug {
+@@ -199,9 +223,7 @@ impl AppleAccount {
+                     return Ok(());
+                 }
+                 LoginState::NeedsDevice2FA => {
+-                    if self.trusted_phone_numbers.is_none() {
+-                        self.trusted_phone_numbers = Some(self.get_trusted_numbers().await?);
+-                    }
++                    self.update_trusted_numbers().await;
+                     self.send_trusted_device_2fa()
+                         .await
+                         .context("Failed to complete trusted device 2FA")?;
+@@ -237,9 +259,7 @@ impl AppleAccount {
+                     }
+                 }
+                 LoginState::NeedsSMS2FA(id) => {
+-                    if self.trusted_phone_numbers.is_none() {
+-                        self.trusted_phone_numbers = Some(self.get_trusted_numbers().await?);
+-                    }
++                    self.update_trusted_numbers().await;
+                     info!("SMS 2FA required");
+                     self.login_state = self
+                         .send_sms_2fa(id)
+@@ -466,46 +486,46 @@ impl AppleAccount {
+             .await
+             .context("Failed to request SMS 2FA")?;
+ 
+-        if !res.status().is_success() {
+-            let status = res.status();
+-            let text = res
+-                .text()
++        let status = res.status();
++        let text = if status.is_success() {
++            String::new()
++        } else {
++            res.text()
+                 .await
+-                .context("Failed to read SMS 2FA error response text")?;
+-            // try to parse as json, if it fails, just bail with the text
+-            let error = Self::parse_sms_error(text, status.as_u16())?;
+-
+-            if error.code == "-28248" {
+-                // Verification codes can’t be sent to this phone number at this time. Please try again later.
+-                warn!("{} - {}", error.title, error.message);
+-                self.last_error = format!("{} - {}", error.title, error.message).into();
+-                return Ok(LoginState::NeedsUnknown2FA);
+-            }
++                .context("Failed to read SMS 2FA response text")?
++        };
+ 
+-            if error.code == "-22979" {
+-                // Too many verification codes have been sent. - Enter the last code you received or try again later.
+-                warn!("{} - {}", error.title, error.message);
+-                self.last_error = format!("{} - {}", error.title, error.message).into();
+-                return Ok(LoginState::NeedsUnknown2FA);
++        match Self::classify_sms_send_response(status.as_u16(), &text, id)? {
++            SmsSendOutcome::Sent => {
++                info!("SMS 2FA request sent");
+             }
+-
+-            if error.code == "-22981" {
+-                // Too many verification codes have been sent. - Enter the last code you received or try again later.
+-                // Not sure why there are two identical errors with different codes
+-                warn!("{} - {}", error.title, error.message);
+-                self.last_error = format!("{} - {}", error.title, error.message).into();
+-                return Ok(LoginState::NeedsUnknown2FA);
++            SmsSendOutcome::ActiveChallenge => {
++                info!("SMS 2FA challenge already active, proceeding to verification");
+             }
++            SmsSendOutcome::ServiceError(error) => {
++                if error.code == "-28248" {
++                    warn!("{} - {}", error.title, error.message);
++                    self.last_error = format!("{} - {}", error.title, error.message).into();
++                    return Ok(LoginState::NeedsUnknown2FA);
++                }
+ 
+-            bail!(
+-                "SMS 2FA request failed (code {}): {} - {}",
+-                error.code,
+-                error.title,
+-                error.message
+-            );
+-        };
++                if matches!(error.code.as_str(), "-22979" | "-22981") {
++                    // Apple refused to send a new SMS, but the last code sent is
++                    // still valid: keep the selected number and let the user
++                    // enter it without triggering another send.
++                    warn!("{} - {}", error.title, error.message);
++                    self.last_error = format!("{} - {}", error.title, error.message).into();
++                    return Ok(LoginState::NeedsSMS2FAVerification(id));
++                }
+ 
+-        info!("SMS 2FA request sent");
++                bail!(
++                    "SMS 2FA request failed (code {}): {} - {}",
++                    error.code,
++                    error.title,
++                    error.message
++                );
++            }
++        }
+ 
+         Ok(LoginState::NeedsSMS2FAVerification(id))
+     }
+@@ -564,37 +584,93 @@ impl AppleAccount {
+         Ok(LoginState::NeedsLogin)
+     }
+ 
+-    fn parse_sms_error(text: String, status: u16) -> Result<SMSTwoFactorError, Report> {
+-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+-            && let Some(service_errors) = json.get("serviceErrors")
+-            && let Some(first_error) = service_errors.as_array().and_then(|arr| arr.first())
++    fn classify_sms_send_response(
++        status: u16,
++        text: &str,
++        requested_number_id: u32,
++    ) -> Result<SmsSendOutcome, Report> {
++        if (200..300).contains(&status) {
++            return Ok(SmsSendOutcome::Sent);
++        }
++
++        if let Some(error) = Self::parse_sms_service_error(text) {
++            return Ok(SmsSendOutcome::ServiceError(error));
++        }
++
++        if status == 412
++            && let Ok(challenge) = serde_json::from_str::<SmsChallengeResponse>(text)
++            && challenge.mode == "sms"
++            && challenge.challenge_type == "verification"
++            && challenge.authentication_type == "hsa2"
++            && challenge.trusted_phone_number.id == requested_number_id
++            && challenge
++                .trusted_phone_numbers
++                .iter()
++                .any(|number| number.id == requested_number_id)
++            && challenge.security_code.length == 6
++            && !challenge.security_code.too_many_codes_sent
++            && !challenge.security_code.too_many_codes_validated
++            && !challenge.security_code.security_code_locked
++            && !challenge.security_code.security_code_cooldown
+         {
+-            let code = first_error
+-                .get("code")
+-                .and_then(|c| c.as_str())
+-                .unwrap_or("unknown");
+-            let title = first_error
+-                .get("title")
+-                .and_then(|t| t.as_str())
+-                .unwrap_or("No title provided");
+-            let message = first_error
+-                .get("message")
+-                .and_then(|m| m.as_str())
+-                .unwrap_or("No message provided");
+-
+-            return Ok(SMSTwoFactorError {
+-                code: code.to_string(),
+-                title: title.to_string(),
+-                message: message.to_string(),
+-            });
++            return Ok(SmsSendOutcome::ActiveChallenge);
+         }
++
+         bail!(
+-            "SMS 2FA code submission failed with http status {}: {}",
++            "SMS 2FA request failed with http status {}: {}",
+             status,
+             text
+         );
+     }
+ 
++    fn parse_sms_service_error(text: &str) -> Option<SMSTwoFactorError> {
++        let json = serde_json::from_str::<serde_json::Value>(text).ok()?;
++        let first_error = json.get("serviceErrors")?.as_array()?.first()?;
++        let code = first_error
++            .get("code")
++            .and_then(|c| c.as_str())
++            .unwrap_or("unknown");
++        let title = first_error
++            .get("title")
++            .and_then(|t| t.as_str())
++            .unwrap_or("No title provided");
++        let message = first_error
++            .get("message")
++            .and_then(|m| m.as_str())
++            .unwrap_or("No message provided");
++
++        Some(SMSTwoFactorError {
++            code: code.to_string(),
++            title: title.to_string(),
++            message: message.to_string(),
++        })
++    }
++
++    fn parse_sms_error(text: String, status: u16) -> Result<SMSTwoFactorError, Report> {
++        Self::parse_sms_service_error(&text).ok_or_else(|| {
++            report!(
++                "SMS 2FA code submission failed with http status {}: {}",
++                status,
++                text
++            )
++        })
++    }
++
++    async fn update_trusted_numbers(&mut self) {
++        if self.trusted_phone_numbers.is_some() {
++            return;
++        }
++        match self.get_trusted_numbers().await {
++            Ok(numbers) => {
++                self.trusted_phone_numbers = Some(numbers);
++            }
++            Err(report) => {
++                // Doesn't need to be a fatal error for users who have trusted devices
++                error!("Failed to retrieve trusted phone numbers:\n{}", report);
++            }
++        };
++    }
++
+     async fn get_trusted_numbers(&mut self) -> Result<Vec<TrustedNumber>, Report> {
+         let anisette_data = self
+             .anisette_generator
+@@ -688,29 +764,24 @@ impl AppleAccount {
+         let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+         let a_pub = srp_client.compute_public_ephemeral(&a);
+ 
+-        let req1 = plist!(dict {
+-            "Header": {
+-                "Version": "1.0.1"
+-            },
+-            "Request": {
+-                "A2k": a_pub, // A2k = client public ephemeral
+-                "cpd": cpd.clone(), // cpd = client provided data
+-                "o": "init", // o = operation
+-                "ps": [ // ps = protocols supported
+-                    "s2k",
+-                    "s2k_fo"
+-                ],
+-                "u": self.email.clone(), // u = username
+-            }
+-        });
+-
+-        debug!("Sending initial login request");
++        let mut raw_response = self
++            .send_init_request(&gs_service_url, &cpd, &a_pub)
++            .await?;
+ 
+-        let response = self
+-            .grandslam_client
+-            .plist_request(&gs_service_url, &req1, None)
+-            .await
+-            .context("Failed to send initial login request")?
++        if let Some(sim) = resync_sim(&raw_response) {
++            debug!("Anisette resync required (hsc 434); syncing then retrying init");
++            let fresh_anisette = self
++                .anisette_generator
++                .resync(&sim)
++                .await
++                .context("Anisette resync failed")?;
++            let fresh_cpd = fresh_anisette.get_client_provided_data();
++            raw_response = self
++                .send_init_request(&gs_service_url, &fresh_cpd, &a_pub)
++                .await
++                .context("Failed to send resynced init request")?;
++        }
++        let response = raw_response
+             .check_grandslam_error()
+             .context("GrandSlam error during initial login request")?;
+ 
+@@ -777,7 +848,12 @@ impl AppleAccount {
+ 
+         let response2 = self
+             .grandslam_client
+-            .plist_request(&gs_service_url, &req2, Some(close_headers))
++            .plist_request(
++                &gs_service_url,
++                &req2,
++                Some(close_headers),
++                self.err_429_retries,
++            )
+             .await
+             .context("Failed to send proof login request")?
+             .check_grandslam_error()
+@@ -822,6 +898,23 @@ impl AppleAccount {
+             });
+         }
+ 
++        if let Some(plist::Value::Integer(hsc)) = status.get("hsc") {
++            match hsc.as_signed() {
++                Some(200) => {}
++                Some(409) => {
++                    info!("2FA code already sent");
++                    self.update_trusted_numbers().await;
++                    return Ok(LoginState::NeedsDevice2FAVerification);
++                }
++                Some(code) => {
++                    warn!("Unknown status code {}: {:?}", code, status);
++                }
++                None => {
++                    warn!("Unknown status code (invalid integer): {:?}", status);
++                }
++            }
++        }
++
+         Ok(LoginState::LoggedIn)
+     }
+ 
+@@ -880,7 +973,7 @@ impl AppleAccount {
+ 
+         let resp = self
+             .grandslam_client
+-            .plist_request(&gs_service_url, &request, None)
++            .plist_request(&gs_service_url, &request, None, self.err_429_retries)
+             .await
+             .context("Failed to send app token request")?
+             .check_grandslam_error()
+@@ -929,6 +1022,36 @@ impl AppleAccount {
+         Ok(app_token)
+     }
+ 
++    async fn send_init_request(
++        &mut self,
++        gs_service_url: &str,
++        cpd: &Dictionary,
++        a_pub: &Vec<u8>,
++    ) -> Result<Dictionary, Report> {
++        debug!("Sending initial login request");
++        let req1 = plist!(dict {
++            "Header": {
++                "Version": "1.0.1"
++            },
++            "Request": {
++                "A2k": a_pub.clone(), // A2k = client public ephemeral
++                "cpd": cpd.clone(), // cpd = client provided data
++                "o": "init", // o = operation
++                "ps": [ // ps = protocols supported
++                    "s2k", // password sent as sha256
++                    "s2k_fo" // password sent as utf8 hex string of sha256
++                ],
++                "u": self.email.clone(), // u = username
++            }
++        });
++
++        Ok(self
++            .grandslam_client
++            .plist_request(gs_service_url, &req1, None, self.err_429_retries)
++            .await
++            .context("Failed to send initial login request")?)
++    }
++
+     fn create_session_key(usr: &ClientVerifier<Sha256>, name: &str) -> Result<Vec<u8>, Report> {
+         Ok(Hmac::<Sha256>::new_from_slice(usr.key())?
+             .chain_update(name.as_bytes())
+diff --git a/isideload/src/auth/builder.rs b/isideload/src/auth/builder.rs
+index 8805772..3baba1f 100644
+--- a/isideload/src/auth/builder.rs
++++ b/isideload/src/auth/builder.rs
+@@ -3,9 +3,10 @@ use std::sync::Arc;
+ use rootcause::prelude::*;
+ use tokio::sync::RwLock;
+ 
++use crate::util::callbacks::TwoFactorCallback;
+ use crate::{
+     anisette::{AnisetteDataGenerator, AnisetteProvider, remote_v3::RemoteV3AnisetteProvider},
+-    auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
++    auth::apple_account::AppleAccount,
+ };
+ 
+ pub struct AppleAccountBuilder {
+@@ -13,6 +14,7 @@ pub struct AppleAccountBuilder {
+     debug: Option<bool>,
+     anisette_generator: Option<AnisetteDataGenerator>,
+     proxy_url: Option<String>,
++    err_429_retries: Option<u32>,
+ }
+ 
+ impl AppleAccountBuilder {
+@@ -26,6 +28,7 @@ impl AppleAccountBuilder {
+             debug: None,
+             anisette_generator: None,
+             proxy_url: None,
++            err_429_retries: None,
+         }
+     }
+ 
+@@ -38,11 +41,20 @@ impl AppleAccountBuilder {
+         self
+     }
+ 
+-    pub fn proxy_url(mut self, proxy_url: String) -> Self {
+-        self.proxy_url = Some(proxy_url);
++    /// Set a proxy URL to use for all network requests, useful for running in a browser with WASM
++    ///
++    /// # Arguments
++    /// - `proxy_url`: The proxy URL to use for all network requests
++    pub fn proxy_url(mut self, proxy_url: Option<String>) -> Self {
++        self.proxy_url = proxy_url;
+         self
+     }
+ 
++    /// Set an anisette provider to use. RemoteV3AnisetteProvider is used by default if none is provided.
++    /// You should create your own instance of RemoteV3AnisetteProvider if you want to use a different anisette server.
++    ///
++    /// # Arguments
++    /// - `anisette_provider`: The anisette provider to use
+     pub fn anisette_provider(
+         mut self,
+         anisette_provider: impl AnisetteProvider + Send + Sync + 'static,
+@@ -53,6 +65,16 @@ impl AppleAccountBuilder {
+         self
+     }
+ 
++    /// Sets the number of retries to attempt when receiving a 429 Too Many Requests response from Apple servers, default is 10.
++    /// Set to None to disable retries.
++    ///
++    /// # Errors
++    /// Returns an error if the reqwest client cannot be built
++    pub fn err_429_retries(mut self, retries: Option<u32>) -> Self {
++        self.err_429_retries = retries;
++        self
++    }
++
+     /// Build the AppleAccount without logging in
+     ///
+     /// # Errors
+@@ -67,7 +89,14 @@ impl AppleAccountBuilder {
+             }
+         };
+ 
+-        AppleAccount::new(&self.email, anisette_generator, debug, self.proxy_url).await
++        AppleAccount::new(
++            &self.email,
++            anisette_generator,
++            debug,
++            self.proxy_url,
++            self.err_429_retries,
++        )
++        .await
+     }
+ 
+     /// Build the AppleAccount and log in
+@@ -77,30 +106,13 @@ impl AppleAccountBuilder {
+     /// - `two_factor_callback`: A callback function that returns the two-factor authentication code
+     /// # Errors
+     /// Returns an error if the reqwest client cannot be built
+-    #[cfg(target_arch = "wasm32")]
+-    pub async fn login<C, Fut>(
+-        self,
+-        password: &str,
+-        two_factor_callback: C,
+-    ) -> Result<AppleAccount, Report>
+-    where
+-        C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
+-        Fut: std::future::Future<Output = Result<TwoFactorCallbackResponse, Report>>,
+-    {
+-        let mut account = self.build().await?;
+-        account.login(password, two_factor_callback).await?;
+-        Ok(account)
+-    }
+-
+-    #[cfg(not(target_arch = "wasm32"))]
+-    pub async fn login<C, Fut>(
++    pub async fn login<C>(
+         self,
+         password: &str,
+         two_factor_callback: C,
+     ) -> Result<AppleAccount, Report>
+     where
+-        C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
+-        Fut: std::future::Future<Output = Result<TwoFactorCallbackResponse, Report>> + Send,
++        C: TwoFactorCallback,
+     {
+         let mut account = self.build().await?;
+         account.login(password, two_factor_callback).await?;
+diff --git a/isideload/src/auth/grandslam.rs b/isideload/src/auth/grandslam.rs
+index 50ba36f..cde887b 100644
+--- a/isideload/src/auth/grandslam.rs
++++ b/isideload/src/auth/grandslam.rs
+@@ -11,6 +11,7 @@ use reqwest::{
+ use reqwest_middleware::ClientBuilder as MwClientBuilder;
+ use rootcause::prelude::*;
+ use tracing::debug;
++use tracing::warn;
+ 
+ #[cfg(not(feature = "wasm"))]
+ use crate::sideload::cert_identity::APPLE_ROOT;
+@@ -48,7 +49,7 @@ impl GrandSlam {
+     /// Fetch the URL bag from GrandSlam and cache it
+     pub async fn fetch_url_bag(
+         client: &reqwest_middleware::ClientWithMiddleware,
+-        base_headers: HeaderMap,
++        mut base_headers: HeaderMap,
+     ) -> Result<Dictionary, Report> {
+         debug!("Fetching URL bag from GrandSlam");
+         let resp = client
+@@ -139,14 +140,41 @@ impl GrandSlam {
+         url: &str,
+         body: &Dictionary,
+         additional_headers: Option<HeaderMap>,
++        retry_limit: Option<u32>,
+     ) -> Result<Dictionary, Report> {
+-        let resp = self
++        let result = self
+             .post(url)?
+-            .headers(additional_headers.unwrap_or_else(reqwest::header::HeaderMap::new))
++            .headers(
++                additional_headers
++                    .clone()
++                    .unwrap_or_else(reqwest::header::HeaderMap::new),
++            )
+             .body(plist_to_xml_string(body))
+             .send()
+             .await
+-            .context("Failed to send grandslam request")?
++            .context("Failed to send grandslam request")?;
++
++        if let Some(retries) = retry_limit
++            && result.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
++        {
++            if retries > 0 {
++                warn!(
++                    "Received 429 Too Many Requests, retrying request ({} retries left)",
++                    retries
++                );
++                return Box::pin(self.plist_request(
++                    url,
++                    body,
++                    additional_headers,
++                    Some(retries - 1),
++                ))
++                .await;
++            } else {
++                bail!("Received 429 Too Many Requests, no retries left");
++            }
++        }
++
++        let resp = result
+             .error_for_status()
+             .context("Received error response from grandslam")?
+             .text()
+@@ -197,6 +225,10 @@ impl GrandSlam {
+             "X-Apple-App-Info",
+             HeaderValue::from_static("com.apple.gs.xcode.auth"),
+         );
++        headers.insert(
++            reqwest::header::CONNECTION,
++            HeaderValue::from_static("close"),
++        );
+ 
+         Ok(headers)
+     }
+@@ -208,7 +240,8 @@ impl GrandSlam {
+     /// # Errors
+     /// Returns an error if the reqwest client cannot be built
+     pub fn build_reqwest_client(
+-        debug: bool,
++        #[cfg(not(feature = "wasm"))] debug: bool,
++        #[cfg(feature = "wasm")] _debug: bool,
+         proxy_url: Option<String>,
+     ) -> Result<reqwest_middleware::ClientWithMiddleware, Report> {
+         #[cfg(not(feature = "wasm"))]
+@@ -219,7 +252,7 @@ impl GrandSlam {
+             .http1_title_case_headers()
+             .danger_accept_invalid_certs(debug)
+             .connection_verbose(debug)
+-            .pool_max_idle_per_host(0)
++            // .pool_max_idle_per_host(0)
+             .build()?;
+         #[cfg(feature = "wasm")]
+         let client = ClientBuilder::new().build()?;
+diff --git a/isideload/src/util/callbacks.rs b/isideload/src/util/callbacks.rs
+new file mode 100644
+index 0000000..2906515
+--- /dev/null
++++ b/isideload/src/util/callbacks.rs
+@@ -0,0 +1,28 @@
++use crate::auth::apple_account::{TwoFactorCallbackParams, TwoFactorCallbackResponse};
++use rootcause::prelude::*;
++
++// don't care if anything's send in the very single threaded wasm
++#[cfg(not(target_arch = "wasm32"))]
++pub trait MaybeSend: Send {}
++
++#[cfg(not(target_arch = "wasm32"))]
++impl<T: Send> MaybeSend for T {}
++
++#[cfg(target_arch = "wasm32")]
++pub trait MaybeSend {}
++
++#[cfg(target_arch = "wasm32")]
++impl<T> MaybeSend for T {}
++
++pub trait TwoFactorCallback: Fn(TwoFactorCallbackParams) -> Self::Future + Send + Sync {
++    type Future: Future<Output = Result<TwoFactorCallbackResponse, Report>> + MaybeSend;
++}
++
++impl<C, Fut> TwoFactorCallback for C
++where
++    C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
++    Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>> + MaybeSend,
++{
++    type Future = Fut;
++}
++
+diff --git a/isideload/src/util/mod.rs b/isideload/src/util/mod.rs
+index abc79df..e1a697c 100644
+--- a/isideload/src/util/mod.rs
++++ b/isideload/src/util/mod.rs
+@@ -1,3 +1,4 @@
++pub mod callbacks;
+ pub mod device;
+ #[cfg(feature = "fs-storage")]
+ pub mod fs_storage;
